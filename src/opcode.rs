@@ -10,8 +10,8 @@ pub enum Opcode {
 
   /// Loads a value from memory using a base address and offset.
   ///
-  /// | Operation        | Semantics/RTL                  | Assembly            |
-  /// |------------------|--------------------------------|---------------------|
+  /// | Operation        | Semantics/RTL                  | Assembly       |
+  /// |------------------|--------------------------------|----------------|
   /// | Load Base+Offset | `r[d] ← m[(o = p × 4) + r[s]]` | `ld o(rs), rd` |
   LoadBaseOff = 0x1,
 
