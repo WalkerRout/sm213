@@ -1,10 +1,11 @@
-use std::mem;
-
 use crate::opcode::Opcode;
 use crate::region::Region;
 
-/// A the type of a single register in our virtual machine
-pub type Register = isize;
+/// Type of a single register in our virtual machine
+pub type Register = i32;
+
+/// Type of a single block of memory
+pub type Block = i32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
@@ -24,7 +25,7 @@ enum State {
 pub struct Vm {
   // this represents the current instruction nibble we are on
   ip: usize,
-  memory: Vec<isize>,
+  memory: Vec<Block>,
   registers: [Register; 7],
   state: State,
 }
@@ -55,11 +56,11 @@ impl Vm {
     Some(())
   }
 
-  fn read_word(&self, address: usize) -> Option<isize> {
+  pub fn read_block(&self, address: usize) -> Option<Block> {
     self.memory.get(address).copied()
   }
 
-  fn write_word(&mut self, address: usize, value: isize) -> Option<()> {
+  pub fn write_block(&mut self, address: usize, value: Block) -> Option<()> {
     self.memory.get_mut(address).map(|prev| {
       *prev = value;
     })
@@ -109,10 +110,10 @@ where
     Some(nibble)
   }
 
-  fn eat_immediate(&mut self) -> Option<Register> {
+  fn eat_immediate(&mut self) -> Option<Block> {
     let mut result = 0;
     for _ in 0..8 {
-      result = (result << 4) | self.eat()? as isize;
+      result = (result << 4) | (self.eat()? as Block);
     }
     Some(result)
   }
@@ -154,7 +155,7 @@ where
   Some(())
 }
 
-// r[d] ← m[(o = p × word_size) + r[s]]
+// r[d] ← m[(o = p × 4) + r[s]]
 fn load_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -162,16 +163,15 @@ where
   let p = task.eat()? as usize;
   let s = task.eat()? as usize;
   let d = task.eat()? as usize;
-  // i actually change the spec a bit here to match variable word size...
-  let o = p * mem::size_of::<isize>(); // is now: o = p × sizeof(uintptr_t)
+  let o = p * 4;
   let rs: usize = task.vm.registers[s].try_into().ok()?; // r[s]
   let target = o + rs;
-  let value = task.vm.read_word(target)?;
+  let value = task.vm.read_block(target)?;
   task.vm.registers[d] = value;
   Some(())
 }
 
-// r[d] ← m[r[s] + r[i] × word_size]
+// r[d] ← m[r[s] + r[i] × 4]
 fn load_indexed<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -181,13 +181,13 @@ where
   let d = task.eat()? as usize;
   let rs: usize = task.vm.registers[s].try_into().ok()?;
   let ri: usize = task.vm.registers[i].try_into().ok()?;
-  let target = rs + ri * mem::size_of::<isize>();
-  let value = task.vm.read_word(target)?;
+  let target = rs + ri * 4;
+  let value = task.vm.read_block(target)?;
   task.vm.registers[d] = value;
   Some(())
 }
 
-// m[(o = p × word_size) + r[d]] ← r[s]
+// m[(o = p × 4) + r[d]] ← r[s]
 fn store_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -195,15 +195,15 @@ where
   let s = task.eat()? as usize;
   let p = task.eat()? as usize;
   let d = task.eat()? as usize;
-  let o = p * mem::size_of::<isize>();
+  let o = p * 4;
   let rd: usize = task.vm.registers[d].try_into().ok()?; // r[d]
   let target = o + rd;
   let value = task.vm.registers[s]; // r[s]
-  task.vm.write_word(target, value)?;
+  task.vm.write_block(target, value)?;
   Some(())
 }
 
-// m[r[d] + r[i] × word_size] ← r[s]
+// m[r[d] + r[i] × 4] ← r[s]
 fn store_indexed<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -213,9 +213,9 @@ where
   let i = task.eat()? as usize;
   let rd: usize = task.vm.registers[d].try_into().ok()?; // r[d]
   let ri: usize = task.vm.registers[i].try_into().ok()?; // r[i]
-  let target = rd + ri * mem::size_of::<isize>();
+  let target = rd + ri * 4;
   let value = task.vm.registers[s]; // r[s]
-  task.vm.write_word(target, value)?;
+  task.vm.write_block(target, value)?;
   Some(())
 }
 
@@ -250,10 +250,10 @@ where
       task.vm.registers[d] += 1;
     }
     0x4 => {
-      // r[d] ← r[d] + word_size
+      // r[d] ← r[d] + 4
       let _ = task.eat()?;
       let d = task.eat()? as usize;
-      task.vm.registers[d] += mem::size_of::<isize>() as isize;
+      task.vm.registers[d] += 4;
     }
     0x5 => {
       // r[d] ← r[d] − 1
@@ -262,10 +262,10 @@ where
       task.vm.registers[d] -= 1;
     }
     0x6 => {
-      // r[d] ← r[d] - word_size
+      // r[d] ← r[d] - 4
       let _ = task.eat()?;
       let d = task.eat()? as usize;
-      task.vm.registers[d] -= mem::size_of::<isize>() as isize;
+      task.vm.registers[d] -= 4;
     }
     0x7 => {
       // r[d] ← ~r[d]
@@ -278,7 +278,7 @@ where
       let p = task.eat()? as usize;
       let d = task.eat()? as usize;
       let o = 2 * p;
-      task.vm.registers[d] = (pc + o) as isize;
+      task.vm.registers[d] = (pc + o) as Register;
     }
     _ => panic!("impossible subcode for misc"),
   }
@@ -307,8 +307,9 @@ where
   R: Region,
 {
   let _ = task.eat()?;
-  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
-  let r#as = pc as isize + pp * 2;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as Block;
+  // operating on blocks of memory, treat pc as some block...
+  let r#as = pc as Block + pp * 2;
   task.vm.ip = r#as as usize;
   Some(())
 }
@@ -360,7 +361,7 @@ where
   R: Region,
 {
   let s = task.eat()? as usize;
-  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as Block;
   let rs = task.vm.registers[s];
   let o = 2 * pp;
   let target = rs + o;
@@ -368,22 +369,22 @@ where
   Some(())
 }
 
-// pc ← m[(o = word_size × pp) + r[s]]
+// pc ← m[(o = 4 × pp) + r[s]]
 fn jump_indir_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
 {
   let s = task.eat()? as usize;
-  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as Block;
   let rs = task.vm.registers[s];
-  let o = mem::size_of::<isize>() as isize * pp;
+  let o = 4 * pp;
   let target = o + rs;
   let target: usize = target.try_into().ok()?;
-  task.vm.ip = task.vm.read_word(target)?.try_into().ok()?;
+  task.vm.ip = task.vm.read_block(target)?.try_into().ok()?;
   Some(())
 }
 
-// pc ← m[word_size × r[i] + r[s]]
+// pc ← m[4 × r[i] + r[s]]
 fn jump_indir_index<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -393,9 +394,9 @@ where
   let _ = task.eat()?;
   let rs = task.vm.registers[s];
   let ri = task.vm.registers[i];
-  let target = mem::size_of::<isize>() as isize * ri + rs;
+  let target = 4 * ri + rs;
   let target: usize = target.try_into().ok()?;
-  task.vm.ip = task.vm.read_word(target)?.try_into().ok()?;
+  task.vm.ip = task.vm.read_block(target)?.try_into().ok()?;
   Some(())
 }
 
@@ -419,7 +420,7 @@ where
 mod tests {
   use super::*;
 
-  fn all_zeroed(iter: impl Iterator<Item = isize>) {
+  fn all_zeroed(iter: impl Iterator<Item = Block>) {
     for i in iter {
       assert_eq!(i, 0);
     }
@@ -452,10 +453,10 @@ mod tests {
       let mut vm = Vm::new();
       vm.registers[2] = 1; // r[s] = 1
       vm.registers[3] = 0; // r[d] = 0
-      vm.memory[9] = 42; // 9 = (8 * 1) + 1
+      vm.memory[4 * 1 + 1] = 42; // 4 * 1 + 1 = 5
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.registers[3], 42); // r[d] = 42
-      assert_eq!(vm.memory[9], 42);
+      assert_eq!(vm.memory[5], 42);
     }
 
     #[test]
@@ -465,8 +466,7 @@ mod tests {
       vm.registers[2] = 3; // r[s] = 8
       vm.registers[3] = 1; // r[i] = 2
       vm.registers[4] = 0; // r[d] = 0
-      let word_size = mem::size_of::<isize>();
-      let effective_address = 3 + 1 * word_size;
+      let effective_address = 3 + 1 * 4;
       vm.memory[effective_address] = 42;
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.registers[4], 42);
@@ -479,8 +479,7 @@ mod tests {
       let mut vm = Vm::new();
       vm.registers[2] = 42; // r[s] = 42
       vm.registers[3] = 1; // r[d] = 1
-      let word_size = mem::size_of::<isize>();
-      let effective_address = 1 + 1 * word_size;
+      let effective_address = 1 + 1 * 4;
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.memory[effective_address], 42);
     }
@@ -492,8 +491,7 @@ mod tests {
       vm.registers[2] = 42; // r[s] = 42
       vm.registers[3] = 1; // r[d] = 1
       vm.registers[4] = 2; // r[i] = 2
-      let word_size = mem::size_of::<isize>();
-      let effective_address = 1 + 2 * word_size;
+      let effective_address = 1 + 2 * 4;
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.memory[effective_address], 42);
     }
@@ -541,9 +539,8 @@ mod tests {
       let chunk: Chunk = vec![0x64, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 8; // r[d] = 8
-      let word_size = mem::size_of::<isize>() as isize;
       assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.registers[1], 8 + word_size); // r[d] = 8 + word_size
+      assert_eq!(vm.registers[1], 8 + 4); // r[d] = 8 + 4
     }
 
     #[test]
@@ -560,9 +557,8 @@ mod tests {
       let chunk: Chunk = vec![0x66, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 16; // r[d] = 16
-      let word_size = mem::size_of::<isize>() as isize;
       assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.registers[1], 16 - word_size); // r[d] = 16 - word_size
+      assert_eq!(vm.registers[1], 16 - 4); // r[d] = 16 - 4
     }
 
     #[test]
@@ -763,15 +759,14 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      vm.memory[0xA + mem::size_of::<isize>() * 1] = 12;
+      vm.memory[0xA + 4 * 1] = 12;
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.ip, 24);
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.ip, 12);
     }
-    
-    //pc ← m[word_size × r[i] + r[s]]
+
     #[test]
     fn step_jump_indir_index() {
       #[rustfmt::skip]
@@ -782,7 +777,7 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      vm.memory[0x4 + mem::size_of::<isize>() * 1] = 12;
+      vm.memory[0x4 + 4 * 1] = 12;
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.ip, 24);
