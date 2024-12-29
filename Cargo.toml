@@ -1,0 +1,15 @@
+[package]
+name = "sm213"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "emulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "main"
+path = "src/bin/main.rs"
+
+[dependencies]
+thiserror = "2.0.9"
