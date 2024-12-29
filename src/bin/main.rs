@@ -1,5 +1,5 @@
-use emulator::vm::Vm;
 use emulator::region::Chunk;
+use emulator::vm::Vm;
 
 fn main() {
   let chunk: Chunk = vec![0x01, 0x00, 0x00, 0x00, 0x10, 0x00].into();

@@ -64,25 +64,6 @@ impl Vm {
       *prev = value;
     })
   }
-
-  fn read_byte(&self, address: usize) -> Option<u8> {
-    let word_address = address / mem::size_of::<isize>();
-    let byte_offset = address % mem::size_of::<isize>();
-    self
-      .memory
-      .get(word_address)
-      .map(|word| ((*word >> (byte_offset * 8)) & 0xFF) as u8)
-  }
-
-  fn write_byte(&mut self, address: usize, value: u8) -> Option<()> {
-    let word_address = address / mem::size_of::<isize>();
-    let byte_offset = address % mem::size_of::<isize>();
-    self.memory.get_mut(word_address).map(|word| {
-      let shift = byte_offset * 8;
-      let mask = !(0xFF << shift); // clear target
-      *word = (*word & mask) | ((value as isize) << shift); // set target
-    })
-  }
 }
 
 impl Default for Vm {
@@ -148,8 +129,13 @@ where
       Opcode::Miscellaneous => miscellaneous(self, pc)?,
       Opcode::Shift => shift(self)?,
       Opcode::Branch => branch(self, pc)?,
+      Opcode::BranchIfEqual => branch_if_equal(self, pc)?,
+      Opcode::BranchIfGreater => branch_if_greater(self, pc)?,
+      Opcode::JumpImmediate => jump_immediate(self)?,
+      Opcode::JumpBaseOff => jump_base_off(self)?,
+      Opcode::JumpIndirBaseOff => jump_indir_base_off(self)?,
+      Opcode::JumpIndirIndex => jump_indir_index(self)?,
       Opcode::Nop => nop(self)?,
-      _ => todo!(),
     }
     Some(())
   }
@@ -168,7 +154,7 @@ where
   Some(())
 }
 
-// r[d] ← m[(o = p × 4) + r[s]]
+// r[d] ← m[(o = p × word_size) + r[s]]
 fn load_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -185,7 +171,7 @@ where
   Some(())
 }
 
-// r[d] ← m[r[s] + r[i] × 4]
+// r[d] ← m[r[s] + r[i] × word_size]
 fn load_indexed<R>(task: &mut Task<'_, '_, R>) -> Option<()>
 where
   R: Region,
@@ -264,7 +250,7 @@ where
       task.vm.registers[d] += 1;
     }
     0x4 => {
-      // r[d] ← r[d] + mem::size_of<isize>()
+      // r[d] ← r[d] + word_size
       let _ = task.eat()?;
       let d = task.eat()? as usize;
       task.vm.registers[d] += mem::size_of::<isize>() as isize;
@@ -276,7 +262,7 @@ where
       task.vm.registers[d] -= 1;
     }
     0x6 => {
-      // r[d] ← r[d] - mem::size_of<isize>()
+      // r[d] ← r[d] - word_size
       let _ = task.eat()?;
       let d = task.eat()? as usize;
       task.vm.registers[d] -= mem::size_of::<isize>() as isize;
@@ -324,6 +310,92 @@ where
   let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
   let r#as = pc as isize + pp * 2;
   task.vm.ip = r#as as usize;
+  Some(())
+}
+
+// if r[s] == 0 : pc ← (aaaaaaaa = pc + pp × 2)
+fn branch_if_equal<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+where
+  R: Region,
+{
+  let s = task.eat()? as usize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let r#as = pc as isize + pp * 2;
+  if task.vm.registers[s] == 0 {
+    task.vm.ip = r#as as usize;
+  }
+  Some(())
+}
+
+// if r[s] > 0 : pc ← (aaaaaaaa = pc + pp × 2)
+fn branch_if_greater<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+where
+  R: Region,
+{
+  let s = task.eat()? as usize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let r#as = pc as isize + pp * 2;
+  if task.vm.registers[s] > 0 {
+    task.vm.ip = r#as as usize;
+  }
+  Some(())
+}
+
+// pc ← aaaaaaaa with .pos aaaaaaaa label:
+fn jump_immediate<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+where
+  R: Region,
+{
+  let _ = task.eat()?;
+  let _ = task.eat()?;
+  let _ = task.eat()?;
+  let r#as: usize = task.eat_immediate()?.try_into().ok()?;
+  task.vm.ip = r#as;
+  Some(())
+}
+
+// pc ← r[s] + (o = 2 × pp)
+fn jump_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+where
+  R: Region,
+{
+  let s = task.eat()? as usize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let rs = task.vm.registers[s];
+  let o = 2 * pp;
+  let target = rs + o;
+  task.vm.ip = target.try_into().ok()?;
+  Some(())
+}
+
+// pc ← m[(o = word_size × pp) + r[s]]
+fn jump_indir_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+where
+  R: Region,
+{
+  let s = task.eat()? as usize;
+  let pp = ((task.eat()? << 4) | task.eat()?) as i8 as isize;
+  let rs = task.vm.registers[s];
+  let o = mem::size_of::<isize>() as isize * pp;
+  let target = o + rs;
+  let target: usize = target.try_into().ok()?;
+  task.vm.ip = task.vm.read_word(target)?.try_into().ok()?;
+  Some(())
+}
+
+// pc ← m[word_size × r[i] + r[s]]
+fn jump_indir_index<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+where
+  R: Region,
+{
+  let s = task.eat()? as usize;
+  let i = task.eat()? as usize;
+  let _ = task.eat()?;
+  let rs = task.vm.registers[s];
+  let ri = task.vm.registers[i];
+  let target = mem::size_of::<isize>() as isize * ri + rs;
+  let target: usize = target.try_into().ok()?;
+  task.vm.ip = task.vm.read_word(target)?.try_into().ok()?;
   Some(())
 }
 
@@ -512,10 +584,11 @@ mod tests {
 
     #[test]
     fn step_misc_get_pc_end() {
+      #[rustfmt::skip]
       let chunk: Chunk = vec![
-        0x01, 0x00, 0x00, 0x00, 0x10, 0x00, // ld $0x1000, r1
-        0x02, 0x00, 0x00, 0x00, 0x20, 0x00, // ld $0x2000, r2
-        0x6F, 0x31, // gpc $6, r1
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0x6F, 0x31,
       ]
       .into();
       let mut vm = Vm::new();
@@ -548,7 +621,7 @@ mod tests {
 
     #[test]
     fn step_branch_forward() {
-      let chunk: Chunk = vec![0x80, 0x02].into(); // 8002 -> br pc + (2 * 2) = pc + 4
+      let chunk: Chunk = vec![0x80, 0x02].into();
       let mut vm = Vm::new();
       vm.ip = 0; // pc = 0
       assert_eq!(vm.step(&chunk), Some(()));
@@ -557,9 +630,10 @@ mod tests {
 
     #[test]
     fn step_branch_backward() {
+      #[rustfmt::skip]
       let chunk: Chunk = vec![
-        0x01, 0x00, 0x00, 0x00, 0x10, 0x00, // ld $0x1000, r1
-        0x02, 0x00, 0x00, 0x00, 0x20, 0x00, // ld $0x1000, r2
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
         0x8F, 0xFA,
       ]
       .into();
@@ -571,6 +645,149 @@ mod tests {
       assert_eq!(vm.ip, 24);
       assert_eq!(vm.step(&chunk), Some(()));
       assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 20
+    }
+
+    #[test]
+    fn step_branch_if_equal_zero() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0x91, 0xFA,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      vm.registers[1] = 0; // meet branch condition
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 12
+    }
+
+    #[test]
+    fn step_branch_if_equal_nonzero() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0x91, 0xFA,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      vm.registers[1] = 1; // do not meet branch condition
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 28); // noop, we should have moved past
+    }
+
+    #[test]
+    fn step_branch_if_greater_zero() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0xA1, 0xFA,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      vm.registers[1] = 0; // do not meet branch condition
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 28); // noop, we should have moved past
+    }
+
+    #[test]
+    fn step_branch_if_greater_nonzero() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0xA1, 0xFA,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      vm.registers[1] = 1; // meet branch condition
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 12
+    }
+
+    #[test]
+    fn step_jump_immediate() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0xB0, 0x00, 0x00, 0x00, 0x00, 0x0C,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12);
+    }
+
+    #[test]
+    fn step_jump_base_off() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x0A, // we store 10 here
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0xC1, 0x01,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12); // pc = r1 + (1 × 2) = 10 + 2 = 12
+    }
+
+    #[test]
+    fn step_jump_indir_base_off() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x0A, // we store 10 here
+        0x02, 0x00, 0x00, 0x00, 0x20, 0x00,
+        0xD1, 0x01,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      vm.memory[0xA + mem::size_of::<isize>() * 1] = 12;
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12);
+    }
+    
+    //pc ← m[word_size × r[i] + r[s]]
+    #[test]
+    fn step_jump_indir_index() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x04, // store 4 (r[s])
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // store 1 (r[i])
+        0xE1, 0x20,
+      ]
+      .into();
+      let mut vm = Vm::new();
+      vm.memory[0x4 + mem::size_of::<isize>() * 1] = 12;
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 24);
+      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.ip, 12);
     }
 
     #[test]
