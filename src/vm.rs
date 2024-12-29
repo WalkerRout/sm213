@@ -18,15 +18,21 @@ enum State {
 /// An error that occurred during execution of instructions
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum Error {
+  /// We are finished reading instructions
   #[error("reached the end of instructions at ip {0}")]
   EndOfInstructions(usize),
 
+  /// We tried to access a memory location that doesnt exist
   #[error("invalid memory accessed at index {0}")]
   InvalidMemory(usize),
-  
+
+  /// Some cast failed somewhere
+  ///
+  /// TODO: add more info (registers? memory? etc...)
   #[error("failed to convert to a different representation")]
   ConversionFailure(#[from] TryFromIntError),
 
+  /// When the machine is halted and we cannot make progress, we indicate such
   #[error("machine is halted")]
   MachineHalted,
 }
@@ -73,15 +79,17 @@ impl Vm {
     task.run()
   }
 
-  pub fn read_block(&self, address: usize) -> Result<Block, Error> {
-    self.memory
+  fn read_block(&self, address: usize) -> Result<Block, Error> {
+    self
+      .memory
       .get(address)
       .ok_or(Error::InvalidMemory(address))
       .copied()
   }
 
-  pub fn write_block(&mut self, address: usize, value: Block) -> Result<(), Error> {
-    self.memory
+  fn write_block(&mut self, address: usize, value: Block) -> Result<(), Error> {
+    self
+      .memory
       .get_mut(address)
       .map(|prev| *prev = value)
       .ok_or(Error::InvalidMemory(address))
@@ -109,7 +117,8 @@ where
 
   #[inline]
   fn eat(&mut self) -> Result<u8, Error> {
-    let byte = self.region
+    let byte = self
+      .region
       .instructions()
       .get(self.vm.ip / 2)
       .ok_or(Error::EndOfInstructions(self.vm.ip))?;
@@ -822,6 +831,120 @@ mod tests {
       // cant progress
       assert_eq!(vm.step(&chunk), Err(Error::MachineHalted));
       assert_eq!(vm.ip, 8);
+    }
+
+    #[test]
+    fn step_through_non_branching_sequence() {
+      #[rustfmt::skip]
+      let chunk: Chunk = vec![
+        0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x11, 0x23,
+        0x21, 0x23,
+        0x31, 0x23,
+        0x41, 0x23,
+        0xF0, 0x00,
+        0xFF, 0x00,
+        0x60, 0x12,
+        0x61, 0x12,
+        0x62, 0x12,
+        0x63, 0x01,
+        0x64, 0x01,
+        0x65, 0x01,
+        0x66, 0x01,
+        0x67, 0x01,
+        0x71, 0x02,
+        0x71, 0xFE,
+      ].into();
+      let mut vm = Vm::new();
+
+      // ld $0x1000, r1
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 0x1000);
+
+      // ld 4(r2), r3
+      vm.registers[2] = 1; // r2 = 1
+      vm.memory[5] = 0x2000; // m[4 * 1 + r2] = 0x2000
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[3], 0x2000); // r3 = 0x2000
+
+      // ld (r1,r2,4), r3
+      vm.registers[1] = 4; // r1 = 4
+      vm.registers[2] = 2; // r2 = 2
+      vm.memory[12] = 0x3000; // m[r1 + r2 * 4] = 0x3000
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[3], 0x3000); // r3 = 0x3000
+
+      // st r1, 8(r3)
+      vm.registers[1] = 0x4000; // r1 = 0x4000
+      vm.registers[3] = 2; // r3 = 2
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.memory[10], 0x4000); // m[8 + r3] = 0x4000
+
+      // st r1, (r2,r3,4)
+      vm.registers[2] = 1; // r2 = 1
+      vm.registers[3] = 2; // r3 = 2
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.memory[9], 0x4000); // m[r2 + r3 * 4] = 0x4000
+
+      // halt
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.state, State::Halted);
+
+      // nop
+      vm.state = State::Active;
+      assert_eq!(vm.step(&chunk), Ok(()));
+
+      // mov r1, r2
+      vm.registers[1] = 5; // r1 = 5
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[2], 5); // r2 = 5
+
+      // add r1, r2
+      vm.registers[1] = 3; // r1 = 3
+      vm.registers[2] = 2; // r2 = 2
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[2], 5); // r2 = r2 + r1 = 5
+
+      // and r1, r2
+      vm.registers[1] = 0xF0; // r1 = 0xF0
+      vm.registers[2] = 0x0F; // r2 = 0x0F
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[2], 0x00); // r2 = r2 & r1 = 0x00
+
+      // inc r1
+      vm.registers[1] = 10; // r1 = 10
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 11); // r1 = r1 + 1
+
+      // inca r1
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 15); // r1 = r1 + 4
+
+      // dec r1
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 14); // r1 = r1 - 1
+
+      // deca r1
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 10); // r1 = r1 - 4
+
+      // not r1
+      vm.registers[1] = 0xFFFF; // r1 = 0xFFFF
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], !0xFFFF); // r1 = ~r1
+
+      // shl $2, r1
+      vm.registers[1] = 1; // r1 = 1
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 4); // r1 = r1 << 2 = 4
+
+      // shr $2, r1
+      vm.registers[1] = 8; // r1 = 8
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.registers[1], 2); // r1 = r1 >> 2 = 2
+
+      // EOF
+      assert_eq!(vm.step(&chunk), Err(Error::EndOfInstructions(76)));
     }
   }
 }
