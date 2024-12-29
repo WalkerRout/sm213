@@ -1,3 +1,5 @@
+use std::num::TryFromIntError;
+
 use crate::opcode::Opcode;
 use crate::region::Region;
 
@@ -11,6 +13,22 @@ pub type Block = i32;
 enum State {
   Active,
   Halted,
+}
+
+/// An error that occurred during execution of instructions
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
+pub enum Error {
+  #[error("reached the end of instructions at ip {0}")]
+  EndOfInstructions(usize),
+
+  #[error("invalid memory accessed at index {0}")]
+  InvalidMemory(usize),
+  
+  #[error("failed to convert to a different representation")]
+  ConversionFailure(#[from] TryFromIntError),
+
+  #[error("machine is halted")]
+  MachineHalted,
 }
 
 /// A virtual machine for SM213 architecture, with slight modifications.
@@ -44,26 +62,29 @@ impl Vm {
   }
 
   /// Step through a single opcode/instruction, indicating failure
-  pub fn step<R>(&mut self, region: &R) -> Option<()>
+  pub fn step<R>(&mut self, region: &R) -> Result<(), Error>
   where
     R: Region,
   {
     if self.state == State::Halted {
-      return None;
+      return Err(Error::MachineHalted);
     }
     let mut task = Task::new(self, region);
-    task.run()?;
-    Some(())
+    task.run()
   }
 
-  pub fn read_block(&self, address: usize) -> Option<Block> {
-    self.memory.get(address).copied()
+  pub fn read_block(&self, address: usize) -> Result<Block, Error> {
+    self.memory
+      .get(address)
+      .ok_or(Error::InvalidMemory(address))
+      .copied()
   }
 
-  pub fn write_block(&mut self, address: usize, value: Block) -> Option<()> {
-    self.memory.get_mut(address).map(|prev| {
-      *prev = value;
-    })
+  pub fn write_block(&mut self, address: usize, value: Block) -> Result<(), Error> {
+    self.memory
+      .get_mut(address)
+      .map(|prev| *prev = value)
+      .ok_or(Error::InvalidMemory(address))
   }
 }
 
@@ -71,19 +92,6 @@ impl Default for Vm {
   fn default() -> Self {
     Self::new()
   }
-}
-
-/// An error that occurred during execution of instructions
-///
-/// TODO: replace all options with result, and make an error variant for each
-/// unique point of failure...
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-  #[error("did not expect to reach the end of instructions")]
-  UnexpectedEof,
-
-  #[error("machine is halted")]
-  MachineHalted,
 }
 
 struct Task<'vm, 'region, R> {
@@ -100,25 +108,28 @@ where
   }
 
   #[inline]
-  fn eat(&mut self) -> Option<u8> {
-    let byte = self.region.instructions().get(self.vm.ip / 2)?;
+  fn eat(&mut self) -> Result<u8, Error> {
+    let byte = self.region
+      .instructions()
+      .get(self.vm.ip / 2)
+      .ok_or(Error::EndOfInstructions(self.vm.ip))?;
     let parity = self.vm.ip & 0x1;
     // we want to shift the byte down if its even (the first nibble),
     // otherwise we want the lowest anyway...
     let nibble = (byte >> (4 * (1 - parity))) & 0xF;
     self.vm.ip += 1;
-    Some(nibble)
+    Ok(nibble)
   }
 
-  fn eat_immediate(&mut self) -> Option<Block> {
+  fn eat_immediate(&mut self) -> Result<Block, Error> {
     let mut result = 0;
     for _ in 0..8 {
       result = (result << 4) | (self.eat()? as Block);
     }
-    Some(result)
+    Ok(result)
   }
 
-  fn run(&mut self) -> Option<()> {
+  fn run(&mut self) -> Result<(), Error> {
     let pc = self.vm.ip;
     let op: Opcode = self.eat()?.into();
     match op {
@@ -138,12 +149,12 @@ where
       Opcode::JumpIndirIndex => jump_indir_index(self)?,
       Opcode::Nop => nop(self)?,
     }
-    Some(())
+    Ok(())
   }
 }
 
 // r[d] ← vvvvvvvv
-fn load_immediate<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn load_immediate<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -152,11 +163,11 @@ where
   let _ = task.eat()?;
   let vs = task.eat_immediate()?;
   task.vm.registers[d] = vs;
-  Some(())
+  Ok(())
 }
 
 // r[d] ← m[(o = p × 4) + r[s]]
-fn load_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn load_base_off<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -164,31 +175,31 @@ where
   let s = task.eat()? as usize;
   let d = task.eat()? as usize;
   let o = p * 4;
-  let rs: usize = task.vm.registers[s].try_into().ok()?; // r[s]
+  let rs: usize = task.vm.registers[s].try_into()?; // r[s]
   let target = o + rs;
   let value = task.vm.read_block(target)?;
   task.vm.registers[d] = value;
-  Some(())
+  Ok(())
 }
 
 // r[d] ← m[r[s] + r[i] × 4]
-fn load_indexed<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn load_indexed<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
   let s = task.eat()? as usize;
   let i = task.eat()? as usize;
   let d = task.eat()? as usize;
-  let rs: usize = task.vm.registers[s].try_into().ok()?;
-  let ri: usize = task.vm.registers[i].try_into().ok()?;
+  let rs: usize = task.vm.registers[s].try_into()?;
+  let ri: usize = task.vm.registers[i].try_into()?;
   let target = rs + ri * 4;
   let value = task.vm.read_block(target)?;
   task.vm.registers[d] = value;
-  Some(())
+  Ok(())
 }
 
 // m[(o = p × 4) + r[d]] ← r[s]
-fn store_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn store_base_off<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -196,30 +207,30 @@ where
   let p = task.eat()? as usize;
   let d = task.eat()? as usize;
   let o = p * 4;
-  let rd: usize = task.vm.registers[d].try_into().ok()?; // r[d]
+  let rd: usize = task.vm.registers[d].try_into()?; // r[d]
   let target = o + rd;
   let value = task.vm.registers[s]; // r[s]
   task.vm.write_block(target, value)?;
-  Some(())
+  Ok(())
 }
 
 // m[r[d] + r[i] × 4] ← r[s]
-fn store_indexed<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn store_indexed<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
   let s = task.eat()? as usize;
   let d = task.eat()? as usize;
   let i = task.eat()? as usize;
-  let rd: usize = task.vm.registers[d].try_into().ok()?; // r[d]
-  let ri: usize = task.vm.registers[i].try_into().ok()?; // r[i]
+  let rd: usize = task.vm.registers[d].try_into()?; // r[d]
+  let ri: usize = task.vm.registers[i].try_into()?; // r[i]
   let target = rd + ri * 4;
   let value = task.vm.registers[s]; // r[s]
   task.vm.write_block(target, value)?;
-  Some(())
+  Ok(())
 }
 
-fn miscellaneous<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+fn miscellaneous<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Result<(), Error>
 where
   R: Region,
 {
@@ -282,12 +293,12 @@ where
     }
     _ => panic!("impossible subcode for misc"),
   }
-  Some(())
+  Ok(())
 }
 
 // r[d] ← r[d] << vv
 // r[d] ← r[d] >> −vv (if vv is negative)
-fn shift<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn shift<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -298,11 +309,11 @@ where
   } else {
     task.vm.registers[d] >>= -vv;
   }
-  Some(())
+  Ok(())
 }
 
 // pc ← (aaaaaaaa = pc + pp × 2)
-fn branch<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+fn branch<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Result<(), Error>
 where
   R: Region,
 {
@@ -311,11 +322,11 @@ where
   // operating on blocks of memory, treat pc as some block...
   let r#as = pc as Block + pp * 2;
   task.vm.ip = r#as as usize;
-  Some(())
+  Ok(())
 }
 
 // if r[s] == 0 : pc ← (aaaaaaaa = pc + pp × 2)
-fn branch_if_equal<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+fn branch_if_equal<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Result<(), Error>
 where
   R: Region,
 {
@@ -325,11 +336,11 @@ where
   if task.vm.registers[s] == 0 {
     task.vm.ip = r#as as usize;
   }
-  Some(())
+  Ok(())
 }
 
 // if r[s] > 0 : pc ← (aaaaaaaa = pc + pp × 2)
-fn branch_if_greater<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Option<()>
+fn branch_if_greater<R>(task: &mut Task<'_, '_, R>, pc: usize) -> Result<(), Error>
 where
   R: Region,
 {
@@ -339,24 +350,24 @@ where
   if task.vm.registers[s] > 0 {
     task.vm.ip = r#as as usize;
   }
-  Some(())
+  Ok(())
 }
 
 // pc ← aaaaaaaa with .pos aaaaaaaa label:
-fn jump_immediate<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn jump_immediate<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
   let _ = task.eat()?;
   let _ = task.eat()?;
   let _ = task.eat()?;
-  let r#as: usize = task.eat_immediate()?.try_into().ok()?;
+  let r#as: usize = task.eat_immediate()?.try_into()?;
   task.vm.ip = r#as;
-  Some(())
+  Ok(())
 }
 
 // pc ← r[s] + (o = 2 × pp)
-fn jump_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn jump_base_off<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -365,12 +376,12 @@ where
   let rs = task.vm.registers[s];
   let o = 2 * pp;
   let target = rs + o;
-  task.vm.ip = target.try_into().ok()?;
-  Some(())
+  task.vm.ip = target.try_into()?;
+  Ok(())
 }
 
 // pc ← m[(o = 4 × pp) + r[s]]
-fn jump_indir_base_off<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn jump_indir_base_off<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -379,13 +390,13 @@ where
   let rs = task.vm.registers[s];
   let o = 4 * pp;
   let target = o + rs;
-  let target: usize = target.try_into().ok()?;
-  task.vm.ip = task.vm.read_block(target)?.try_into().ok()?;
-  Some(())
+  let target: usize = target.try_into()?;
+  task.vm.ip = task.vm.read_block(target)?.try_into()?;
+  Ok(())
 }
 
 // pc ← m[4 × r[i] + r[s]]
-fn jump_indir_index<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn jump_indir_index<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -395,13 +406,13 @@ where
   let rs = task.vm.registers[s];
   let ri = task.vm.registers[i];
   let target = 4 * ri + rs;
-  let target: usize = target.try_into().ok()?;
-  task.vm.ip = task.vm.read_block(target)?.try_into().ok()?;
-  Some(())
+  let target: usize = target.try_into()?;
+  task.vm.ip = task.vm.read_block(target)?.try_into()?;
+  Ok(())
 }
 
 // (stop execution) ∨ (do nothing)
-fn nop<R>(task: &mut Task<'_, '_, R>) -> Option<()>
+fn nop<R>(task: &mut Task<'_, '_, R>) -> Result<(), Error>
 where
   R: Region,
 {
@@ -413,7 +424,7 @@ where
   }
   let _ = task.eat()?;
   let _ = task.eat()?;
-  Some(())
+  Ok(())
 }
 
 #[cfg(test)]
@@ -443,7 +454,7 @@ mod tests {
     fn step_load_immediate() {
       let chunk: Chunk = vec![0x01, 0x00, 0x00, 0x00, 0x10, 0x00].into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 0x1000);
     }
 
@@ -454,7 +465,7 @@ mod tests {
       vm.registers[2] = 1; // r[s] = 1
       vm.registers[3] = 0; // r[d] = 0
       vm.memory[4 * 1 + 1] = 42; // 4 * 1 + 1 = 5
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[3], 42); // r[d] = 42
       assert_eq!(vm.memory[5], 42);
     }
@@ -468,7 +479,7 @@ mod tests {
       vm.registers[4] = 0; // r[d] = 0
       let effective_address = 3 + 1 * 4;
       vm.memory[effective_address] = 42;
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[4], 42);
       assert_eq!(vm.memory[effective_address], 42);
     }
@@ -480,7 +491,7 @@ mod tests {
       vm.registers[2] = 42; // r[s] = 42
       vm.registers[3] = 1; // r[d] = 1
       let effective_address = 1 + 1 * 4;
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.memory[effective_address], 42);
     }
 
@@ -492,7 +503,7 @@ mod tests {
       vm.registers[3] = 1; // r[d] = 1
       vm.registers[4] = 2; // r[i] = 2
       let effective_address = 1 + 2 * 4;
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.memory[effective_address], 42);
     }
 
@@ -501,7 +512,7 @@ mod tests {
       let chunk: Chunk = vec![0x60, 0x12].into(); // s=1, d=2
       let mut vm = Vm::new();
       vm.registers[1] = 42; // r[s] = 42
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[2], 42); // r[d] = 42
     }
 
@@ -511,7 +522,7 @@ mod tests {
       let mut vm = Vm::new();
       vm.registers[1] = 10; // r[s] = 10
       vm.registers[2] = 20; // r[d] = 20
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[2], 30); // r[d] = 30
     }
 
@@ -521,7 +532,7 @@ mod tests {
       let mut vm = Vm::new();
       vm.registers[1] = 0b1100; // r[s] = 12
       vm.registers[2] = 0b1010; // r[d] = 10
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[2], 0b1000); // r[d] = 8
     }
 
@@ -530,7 +541,7 @@ mod tests {
       let chunk: Chunk = vec![0x63, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 10; // r[d] = 10
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 11); // r[d] = 11
     }
 
@@ -539,7 +550,7 @@ mod tests {
       let chunk: Chunk = vec![0x64, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 8; // r[d] = 8
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 8 + 4); // r[d] = 8 + 4
     }
 
@@ -548,7 +559,7 @@ mod tests {
       let chunk: Chunk = vec![0x65, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 10; // r[d] = 10
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 9); // r[d] = 9
     }
 
@@ -557,7 +568,7 @@ mod tests {
       let chunk: Chunk = vec![0x66, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 16; // r[d] = 16
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 16 - 4); // r[d] = 16 - 4
     }
 
@@ -566,7 +577,7 @@ mod tests {
       let chunk: Chunk = vec![0x67, 0x01].into(); // d=1
       let mut vm = Vm::new();
       vm.registers[1] = 0b1010; // r[d] = 10
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], !0b1010); // r[d] = ~10
     }
 
@@ -574,7 +585,7 @@ mod tests {
     fn step_misc_get_pc_start() {
       let chunk: Chunk = vec![0x6F, 0x31].into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 6); // r1 = 0 + (2 * 3) = 0 + 6 = 6
     }
 
@@ -588,11 +599,11 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 0x1000);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[2], 0x2000);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 30); // r1 = 24 + (2 * 3) = 24 + 6 = 30
     }
 
@@ -601,7 +612,7 @@ mod tests {
       let chunk: Chunk = vec![0x71, 0x02].into();
       let mut vm = Vm::new();
       vm.registers[1] = 0b0001; // r1 = 1
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 0b0100); // r1 <<= 1 becomes 4
     }
 
@@ -611,7 +622,7 @@ mod tests {
       let chunk: Chunk = vec![0x71, 0xFE].into();
       let mut vm = Vm::new();
       vm.registers[1] = 0b1000; // r1 = 1
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.registers[1], 0b0010); // r1 >>= 8 becomes 2
     }
 
@@ -620,7 +631,7 @@ mod tests {
       let chunk: Chunk = vec![0x80, 0x02].into();
       let mut vm = Vm::new();
       vm.ip = 0; // pc = 0
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 4); // pc = 0 + (2 * 2) = 4
     }
 
@@ -635,11 +646,11 @@ mod tests {
       .into();
       let mut vm = Vm::new();
       // skip two
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       // now we branch
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 20
     }
 
@@ -653,11 +664,11 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       vm.registers[1] = 0; // meet branch condition
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 12
     }
 
@@ -671,11 +682,11 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       vm.registers[1] = 1; // do not meet branch condition
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 28); // noop, we should have moved past
     }
 
@@ -689,11 +700,11 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       vm.registers[1] = 0; // do not meet branch condition
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 28); // noop, we should have moved past
     }
 
@@ -707,11 +718,11 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       vm.registers[1] = 1; // meet branch condition
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12); // pc = 24 + (-6 * 2) = 12
     }
 
@@ -725,10 +736,10 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12);
     }
 
@@ -742,10 +753,10 @@ mod tests {
       ]
       .into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12); // pc = r1 + (1 × 2) = 10 + 2 = 12
     }
 
@@ -760,10 +771,10 @@ mod tests {
       .into();
       let mut vm = Vm::new();
       vm.memory[0xA + 4 * 1] = 12;
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12);
     }
 
@@ -778,10 +789,10 @@ mod tests {
       .into();
       let mut vm = Vm::new();
       vm.memory[0x4 + 4 * 1] = 12;
-      assert_eq!(vm.step(&chunk), Some(()));
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 24);
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 12);
     }
 
@@ -789,7 +800,7 @@ mod tests {
     fn step_nop() {
       let chunk: Chunk = vec![0xFF, 0x00].into();
       let mut vm = Vm::new();
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 4);
       assert_eq!(vm.state, State::Active);
       all_zeroed(vm.memory.into_iter());
@@ -801,15 +812,15 @@ mod tests {
       let chunk: Chunk = vec![0xFF, 0x00, 0xF0, 0x00].into();
       let mut vm = Vm::new();
       // normal nop
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 4);
       assert_eq!(vm.state, State::Active);
       // execute halt
-      assert_eq!(vm.step(&chunk), Some(()));
+      assert_eq!(vm.step(&chunk), Ok(()));
       assert_eq!(vm.ip, 8);
       assert_eq!(vm.state, State::Halted);
       // cant progress
-      assert_eq!(vm.step(&chunk), None);
+      assert_eq!(vm.step(&chunk), Err(Error::MachineHalted));
       assert_eq!(vm.ip, 8);
     }
   }

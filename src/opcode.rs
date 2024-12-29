@@ -38,9 +38,6 @@ pub enum Opcode {
 
   /// A placeholder opcode with no specific functionality defined.
   ///
-  /// NOTE: the `4` increments are not exactly what we do, cause i can do whatever
-  /// i want...
-  ///
   /// | Operation           | Semantics/RTL             | Assembly     |
   /// |---------------------|---------------------------|--------------|
   /// | Move                | `r[d] ← r[s]`             | `mov rs, rd` |
