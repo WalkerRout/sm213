@@ -68,7 +68,6 @@ impl Vm {
   fn read_byte(&self, address: usize) -> Option<u8> {
     let word_address = address / mem::size_of::<isize>();
     let byte_offset = address % mem::size_of::<isize>();
-
     self
       .memory
       .get(word_address)
@@ -93,6 +92,9 @@ impl Default for Vm {
 }
 
 /// An error that occurred during execution of instructions
+///
+/// TODO: replace all options with result, and make an error variant for each
+/// unique point of failure...
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
   #[error("did not expect to reach the end of instructions")]
@@ -115,7 +117,7 @@ where
     Self { vm, region }
   }
 
-  //#[inline]
+  #[inline]
   fn eat(&mut self) -> Option<u8> {
     let byte = self.region.instructions().get(self.vm.ip / 2)?;
     let parity = self.vm.ip & 0x1;
