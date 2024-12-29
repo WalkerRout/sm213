@@ -37,14 +37,7 @@ pub enum Error {
   MachineHalted,
 }
 
-/// A virtual machine for SM213 architecture, with slight modifications.
-///
-/// In the original spec, it was noted that:
-///
-/// "Offsets indicated with o in assembly are stored in compressed form as p in
-/// machine code (meaning o × 2 or o × 4, as in the semantics column"
-///
-/// We instead just use the word size of the target platform...
+/// A 1-1 virtual machine for the 32bit SM213 architecture
 #[derive(Debug)]
 pub struct Vm {
   // this represents the current instruction nibble we are on
